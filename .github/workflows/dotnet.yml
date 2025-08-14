@@ -1,0 +1,152 @@
+name: FJ.Leb128 Build and Test
+
+on:
+  push:
+    branches: [ "main", "initial" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      Version: ${{ steps.gitversion.outputs.SemVer }}
+      CommitsSinceVersionSource: ${{ steps.gitversion.outputs.CommitsSinceVersionSource }}
+
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+    - name: Install GitVersion
+      uses: gittools/actions/gitversion/setup@v3.0.3
+      with:
+        versionSpec: 6.0.x
+    - name: Determine Version
+      uses: gittools/actions/gitversion/execute@v3.0.3
+      with:
+        useConfigFile: true          
+      id: gitversion
+    - name: Display gitVersion outputs
+      run: |
+        echo "Version: ${{ steps.gitversion.outputs.SemVer }}"
+        echo "CommitsSinceVersionSource: ${{ steps.gitversion.outputs.CommitsSinceVersionSource }}"
+    - name: Restore dependencies
+      working-directory: ./src
+      run: dotnet restore
+    - name: Build
+      working-directory: ./src
+      run: dotnet build --no-restore
+    - name: Test
+      working-directory: ./src
+      run: |
+        dotnet test --no-build --logger trx --collect:"XPlat Code Coverage"
+    - name: Code Coverage Report,x
+      uses: irongut/CodeCoverageSummary@v1.3.0
+      with:
+        filename: src/*.Tests/**/coverage.cobertura.xml
+        badge: true
+        fail_below_min: true
+        format: markdown
+        hide_branch_rate: false
+        hide_complexity: true
+        indicators: true
+        output: both
+        thresholds: '60 80'
+    - name: Combine Coverage Reports
+      uses: danielpalme/ReportGenerator-GitHub-Action@5.2.4
+      with:
+        reports: "**/*.cobertura.xml"
+        targetdir: "${{ github.workspace }}"
+        reporttypes: "Cobertura;MarkdownSummaryGithub;html"
+        verbosity: "Info"
+        title: "Code Coverage"
+        tag: "${{ github.run_number }}_${{ github.run_id }}"
+        customSettings: ""
+        toolpath: "reportgeneratortool"
+    - name: Upload Combined Coverage XML
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage
+        path: ${{ github.workspace }}/Cobertura.xml
+        retention-days: 5
+    - name: Publish Code Coverage Report
+      uses: irongut/CodeCoverageSummary@v1.3.0
+      with:
+        filename: "Cobertura.xml"
+        badge: true
+        fail_below_min: false
+        format: markdown
+        hide_branch_rate: false
+        hide_complexity: false
+        indicators: true
+        output: both
+        thresholds: "50 80"
+    - name: Publish coverage in build summary
+      run: cat ${{ github.workspace }}/SummaryGithub.md >> $GITHUB_STEP_SUMMARY
+      shell: bash
+    - name: Add Coverage PR Comment
+      uses: marocchino/sticky-pull-request-comment@v2
+      if: github.event_name == 'pull_request'
+      with:
+        recreate: true
+        path: code-coverage-results.md
+    - name: Upload Test Result Files
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: ${{ github.workspace }}/**/TestResults/**/*
+        retention-days: 5
+    - uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report-html
+        path: |
+          ${{ github.workspace }}/*.html
+          ${{ github.workspace }}/report.css
+    - name: Publish Test Results
+      uses: EnricoMi/publish-unit-test-result-action@v2.16.1
+      if: always()
+      with:
+        trx_files: "${{ github.workspace }}/**/*.trx"
+    - name: Build and pack
+      run: dotnet pack ${{ vars.CS_PROJ_PATH }} -p:Version='${{ steps.gitversion.outputs.SemVer }}' -c Release
+    - name: Upload NuGet package to GitHub
+      uses: actions/upload-artifact@v4
+      with:
+        name: nugetPackage
+        path: src/FJ.Leb128/bin/Release/*.nupkg
+        retention-days: 1
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - name: Download nuget package artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: nugetPackage
+        path: nugetPackage
+    - name: Prep packages
+      run: dotnet nuget add source --username ${{ vars.USERNAME }} --password ${{ secrets.NUGET_PACKAGE_TOKEN }} --store-password-in-clear-text --name fjgithub "https://nuget.pkg.github.com/${{ vars.USERNAME }}/index.json"
+    - name: Push package to github packages
+      if: needs.build.outputs.CommitsSinceVersionSource > 0
+      run: dotnet nuget push nugetPackage/*.nupkg --api-key ${{ secrets.NUGET_PACKAGE_TOKEN }} --source "fjgithub"
+    - name: Create Release
+      if: needs.build.outputs.CommitsSinceVersionSource > 0
+      uses: ncipollo/release-action@v1.13.0
+      with:
+        tag: ${{ needs.build.outputs.Version }}
+        name: Release ${{ needs.build.outputs.Version }}
+        artifacts: "nugetPackage/*"
+        token: ${{ secrets.NUGET_PACKAGE_TOKEN }}
+      
